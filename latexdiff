@@ -2600,7 +2600,8 @@ sub tokenizeblocks {
 }
 
 # detect_moves($seq1, $seq2)
-# Detect moved passages using a simplified Heckel algorithm
+# Detect moved passages by first running a normal diff to find all added and deleted blocks,
+# then looking for common subsequences between deleted and added blocks that could be moves.
 # Returns hash references with move information:
 # {
 #   moves => [ {from_start, from_end, to_start, to_end, length}, ... ],
@@ -2615,108 +2616,450 @@ sub detect_moves {
   # Key function for comparing tokens (same as used in diff)
   my $keyfunc = sub { join("  ", split(" ", shift())) };
   
-  # Create occurrence tables
-  my %old_occur;  # token -> [indices where it occurs in old]
-  my %new_occur;  # token -> [indices where it occurs in new]
+  # First, run a normal diff to identify which tokens would be discarded/added
+  my @would_be_discarded = (0) x @old_seq;
+  my @would_be_added = (0) x @new_seq;
+  
+  # Collect which tokens would be discarded and added in normal diff processing
+  my $mark_discard = sub {
+    my $old_idx = $_[0];
+    $would_be_discarded[$old_idx] = 1;
+  };
+  
+  my $mark_add = sub {
+    my $new_idx = $_[1];
+    $would_be_added[$new_idx] = 1;
+  };
+  
+  my $mark_match = sub {
+    # Do nothing - these tokens are already matching
+  };
+  
+  # Run diff to identify discarded and added tokens
+  traverse_sequences(\@old_seq, \@new_seq, {
+    MATCH => $mark_match,
+    DISCARD_A => $mark_discard,
+    DISCARD_B => $mark_add
+  }, $keyfunc);
+  
+  # Now collect only the blocks of discarded and added tokens
+  my @deleted_blocks = ();
+  my @added_blocks = ();
+  
+  # Collect consecutive discarded tokens into blocks
+  my $current_del_start = -1;
+  my $current_del_tokens = [];
   
   for my $i (0..$#old_seq) {
-    my $key = $keyfunc->($old_seq[$i]);
-    push @{$old_occur{$key}}, $i;
+    if ($would_be_discarded[$i]) {
+      if ($current_del_start == -1) {
+        $current_del_start = $i;
+        $current_del_tokens = [];
+      }
+      push @$current_del_tokens, $old_seq[$i];
+    } else {
+      if ($current_del_start != -1) {
+        push @deleted_blocks, {
+          start => $current_del_start,
+          end => $current_del_start + @$current_del_tokens - 1,
+          tokens => [@$current_del_tokens]
+        };
+        $current_del_start = -1;
+      }
+    }
   }
+  # Don't forget the last block
+  if ($current_del_start != -1) {
+    push @deleted_blocks, {
+      start => $current_del_start,
+      end => $current_del_start + @$current_del_tokens - 1,
+      tokens => [@$current_del_tokens]
+    };
+  }
+  
+  # Collect consecutive added tokens into blocks
+  my $current_add_start = -1;
+  my $current_add_tokens = [];
   
   for my $i (0..$#new_seq) {
-    my $key = $keyfunc->($new_seq[$i]);
-    push @{$new_occur{$key}}, $i;
+    if ($would_be_added[$i]) {
+      if ($current_add_start == -1) {
+        $current_add_start = $i;
+        $current_add_tokens = [];
+      }
+      push @$current_add_tokens, $new_seq[$i];
+    } else {
+      if ($current_add_start != -1) {
+        push @added_blocks, {
+          start => $current_add_start,
+          end => $current_add_start + @$current_add_tokens - 1,
+          tokens => [@$current_add_tokens]
+        };
+        $current_add_start = -1;
+      }
+    }
+  }
+  # Don't forget the last block
+  if ($current_add_start != -1) {
+    push @added_blocks, {
+      start => $current_add_start,
+      end => $current_add_start + @$current_add_tokens - 1,
+      tokens => [@$current_add_tokens]
+    };
   }
   
-  # Find tokens that appear exactly once in both sequences
-  my %unique_tokens;
-  for my $token (keys %old_occur) {
-    if (exists $new_occur{$token} && 
-        @{$old_occur{$token}} == 1 && 
-        @{$new_occur{$token}} == 1) {
-      $unique_tokens{$token} = {
-        old_pos => $old_occur{$token}->[0],
-        new_pos => $new_occur{$token}->[0]
-      };
+  if ($verbose) {
+    print STDERR "Found " . @deleted_blocks . " deleted blocks and " . @added_blocks . " added blocks\n";
+    print STDERR "All discarded flags: ";
+    for my $i (0..$#would_be_discarded) {
+      print STDERR "$would_be_discarded[$i]";
+    }
+    print STDERR "\n";
+    print STDERR "All added flags: ";
+    for my $i (0..$#would_be_added) {
+      print STDERR "$would_be_added[$i]";
+    }
+    print STDERR "\n";
+    print STDERR "Old sequence tokens:\n";
+    for my $i (0..$#old_seq) {
+      print STDERR "  [$i] " . ($would_be_discarded[$i] ? "DEL" : "   ") . " |$old_seq[$i]|\n";
+    }
+    print STDERR "New sequence tokens:\n";
+    for my $i (0..$#new_seq) {
+      print STDERR "  [$i] " . ($would_be_added[$i] ? "ADD" : "   ") . " |$new_seq[$i]|\n";
+    }
+    print STDERR "Deleted blocks:\n";
+    for my $i (0..$#deleted_blocks) {
+      print STDERR "  Block $i: " . join(" ", @{$deleted_blocks[$i]->{tokens}}) . "\n";
+    }
+    print STDERR "Added blocks:\n";
+    for my $i (0..$#added_blocks) {
+      print STDERR "  Block $i: " . join(" ", @{$added_blocks[$i]->{tokens}}) . "\n";
     }
   }
   
-  # Create sorted list of unique token anchors
-  my @anchors = sort { $a->{old_pos} <=> $b->{old_pos} } values %unique_tokens;
-  
-  # Track which positions are already marked as moves
+  # Initialize tracking arrays for moves
   my @old_marked = (0) x @old_seq;
   my @new_marked = (0) x @new_seq;
   my @moves;
   
-  # Minimum move length to consider (avoid marking single-word moves)
-  my $min_move_length = 3;
+  # Step 2: Look for moves by finding common content between deleted and added tokens/blocks
+  # We'll search both at the block level and at the individual token level
   
-  # Find longest common subsequences between anchors to detect moves
-  for my $i (0..$#anchors-1) {
-    my $anchor1 = $anchors[$i];
-    my $anchor2 = $anchors[$i+1];
+  # First try block-level moves
+  for my $del_block (@deleted_blocks) {
+    my @del_tokens = @{$del_block->{tokens}};
+    next if @del_tokens < 2;  # Reduced minimum size
     
-    # Look for sequences that moved between these anchors
-    my $old_start = $anchor1->{old_pos} + 1;
-    my $old_end = $anchor2->{old_pos} - 1;
-    my $new_start = $anchor1->{new_pos} + 1;
-    my $new_end = $anchor2->{new_pos} - 1;
-    
-    # Skip if ranges are too small
-    next if $old_end < $old_start || $new_end < $new_start;
-    
-    # Check if sequences moved (comparing token keys)
-    my @old_keys = map { $keyfunc->($old_seq[$_]) } ($old_start..$old_end);
-    my @new_keys = map { $keyfunc->($new_seq[$_]) } ($new_start..$new_end);
-    
-    # Simple move detection: look for exact subsequence matches
-    for my $old_i (0..$#old_keys) {
-      for my $new_i (0..$#new_keys) {
-        my $match_len = 0;
+    for my $add_block (@added_blocks) {
+      my @add_tokens = @{$add_block->{tokens}};
+      next if @add_tokens < 2;  # Reduced minimum size
+      
+      # Find the longest common subsequence between these two blocks
+      my $lcs_result = find_lcs(\@del_tokens, \@add_tokens, $keyfunc);
+      
+      if ($verbose) {
+        print STDERR "Comparing deleted block: " . join(" ", @del_tokens) . "\n";
+        print STDERR "With added block: " . join(" ", @add_tokens) . "\n";
+        if ($lcs_result && @{$lcs_result->{matches}}) {
+          print STDERR "Found " . scalar(@{$lcs_result->{matches}}) . " LCS matches\n";
+          for my $match (@{$lcs_result->{matches}}) {
+            print STDERR "  Match: del[$match->{del_idx}] = add[$match->{add_idx}] = '$del_tokens[$match->{del_idx}]'\n";
+          }
+        } else {
+          print STDERR "No LCS matches found\n";
+        }
+      }
+      
+      if ($lcs_result && @{$lcs_result->{matches}} >= 2) {  # Reduced threshold
+        # We found a potential move - check if it's significant enough
+        my @matches = @{$lcs_result->{matches}};
         
-        # Count matching sequence length
-        while ($old_i + $match_len <= $#old_keys && 
-               $new_i + $match_len <= $#new_keys &&
-               $old_keys[$old_i + $match_len] eq $new_keys[$new_i + $match_len] &&
-               !$old_marked[$old_start + $old_i + $match_len] &&
-               !$new_marked[$new_start + $new_i + $match_len]) {
-          $match_len++;
+        # Calculate some quality metrics
+        my $total_chars = 0;
+        my $significant_tokens = 0;
+        for my $match (@matches) {
+          my $token = $del_tokens[$match->{del_idx}];
+          $total_chars += length($token);
+          if (length($token) > 2 && $token =~ /[a-zA-Z]/) {
+            $significant_tokens++;
+          }
         }
         
-        # If we found a significant match, record it as a move
-        if ($match_len >= $min_move_length) {
-          my $from_start = $old_start + $old_i;
-          my $to_start = $new_start + $new_i;
+        # Only consider this a move if:
+        # - At least 2 matching tokens
+        # - At least 1 significant token  
+        # - At least 10 characters total
+        if (@matches >= 2 && $significant_tokens >= 1 && $total_chars >= 10) {
           
-          push @moves, {
-            from_start => $from_start,
-            from_end => $from_start + $match_len - 1,
-            to_start => $to_start,
-            to_end => $to_start + $match_len - 1,
-            length => $match_len
-          };
+          # Find the contiguous ranges in both sequences
+          my @del_ranges = find_contiguous_ranges(\@matches, sub { $_[0]->{del_idx} });
+          my @add_ranges = find_contiguous_ranges(\@matches, sub { $_[0]->{add_idx} });
           
-          # Mark these positions as used
-          for my $j (0..$match_len-1) {
-            $old_marked[$from_start + $j] = 1;
-            $new_marked[$to_start + $j] = 1;
+          # Process each contiguous range as a potential move
+          for my $range_idx (0..$#del_ranges) {
+            last if $range_idx > $#add_ranges;
+            
+            my $del_range = $del_ranges[$range_idx];
+            my $add_range = $add_ranges[$range_idx];
+            
+            # Calculate global positions
+            my $from_start = $del_block->{start} + $del_range->{start};
+            my $from_end = $del_block->{start} + $del_range->{end};
+            my $to_start = $add_block->{start} + $add_range->{start};
+            my $to_end = $add_block->{start} + $add_range->{end};
+            
+            # Check if this range is already marked as a move
+            my $already_marked = 0;
+            for my $idx ($from_start..$from_end) {
+              if ($old_marked[$idx]) {
+                $already_marked = 1;
+                last;
+              }
+            }
+            for my $idx ($to_start..$to_end) {
+              if ($new_marked[$idx]) {
+                $already_marked = 1;
+                last;
+              }
+            }
+            
+            if (!$already_marked && $del_range->{length} >= 2) {  # Reduced minimum
+              # Mark the ranges as moved
+              for my $idx ($from_start..$from_end) {
+                $old_marked[$idx] = 1;
+              }
+              for my $idx ($to_start..$to_end) {
+                $new_marked[$idx] = 1;
+              }
+              
+              my @moved_tokens = @del_tokens[$del_range->{start}..$del_range->{end}];
+              
+              push @moves, {
+                from_start => $from_start,
+                from_end => $from_end,
+                to_start => $to_start,
+                to_end => $to_end,
+                length => $del_range->{length},
+                del_block => $del_block,
+                add_block => $add_block,
+                tokens => [@moved_tokens]
+              };
+              
+              print STDERR "Detected move (" . $del_range->{length} . " tokens): " . join(" ", @moved_tokens) . "\n" if $verbose;
+            }
           }
-          
-          # Skip ahead to avoid overlapping matches
-          $old_i += $match_len - 1;
-          last;
         }
       }
     }
   }
+  
+  # Second, try cross-block token-level moves (for cases where individual sentences move)
+  # Collect all deleted and added tokens with their positions
+  my @all_deleted_tokens = ();
+  my @all_added_tokens = ();
+  
+  for my $i (0..$#old_seq) {
+    if ($would_be_discarded[$i] && !$old_marked[$i]) {
+      push @all_deleted_tokens, { token => $old_seq[$i], idx => $i };
+    }
+  }
+  
+  for my $i (0..$#new_seq) {
+    if ($would_be_added[$i] && !$new_marked[$i]) {
+      push @all_added_tokens, { token => $new_seq[$i], idx => $i };
+    }
+  }
+  
+  if ($verbose && (@all_deleted_tokens || @all_added_tokens)) {
+    print STDERR "Looking for token-level moves among " . @all_deleted_tokens . " deleted and " . @all_added_tokens . " added tokens\n";
+    print STDERR "Deleted tokens: " . join(" | ", map { $_->{token} } @all_deleted_tokens) . "\n";
+    print STDERR "Added tokens: " . join(" | ", map { $_->{token} } @all_added_tokens) . "\n";
+  }
+  
+  # Look for contiguous sequences of matching tokens
+  for my $del_start (0..$#all_deleted_tokens) {
+    next if $old_marked[$all_deleted_tokens[$del_start]->{idx}];  # Skip if already marked
+    
+    for my $add_start (0..$#all_added_tokens) {
+      next if $new_marked[$all_added_tokens[$add_start]->{idx}];  # Skip if already marked
+      
+      # Try to find matching sequences starting from these positions
+      my $match_length = 0;
+      my $max_match_length = 0;
+      
+      # Find the longest matching sequence
+      my $max_len_to_check = ($#all_deleted_tokens - $del_start) < ($#all_added_tokens - $add_start) 
+                           ? ($#all_deleted_tokens - $del_start) 
+                           : ($#all_added_tokens - $add_start);
+      
+      for my $offset (0..$max_len_to_check) {
+        my $del_idx = $del_start + $offset;
+        my $add_idx = $add_start + $offset;
+        
+        # Check if these indices are still available and within bounds
+        last if $del_idx > $#all_deleted_tokens || $add_idx > $#all_added_tokens;
+        last if $old_marked[$all_deleted_tokens[$del_idx]->{idx}];
+        last if $new_marked[$all_added_tokens[$add_idx]->{idx}];
+        
+        my $del_key = $keyfunc->($all_deleted_tokens[$del_idx]->{token});
+        my $add_key = $keyfunc->($all_added_tokens[$add_idx]->{token});
+        
+        if ($del_key eq $add_key) {
+          $match_length++;
+          $max_match_length = $match_length;
+        } else {
+          last;  # Stop at first mismatch
+        }
+      }
+      
+      # If we found a significant match, record it as a move
+      if ($max_match_length >= 2) {  # At least 2 consecutive tokens
+        my @move_tokens = ();
+        my $total_chars = 0;
+        my $significant_tokens = 0;
+        
+        for my $offset (0..$max_match_length-1) {
+          my $token = $all_deleted_tokens[$del_start + $offset]->{token};
+          push @move_tokens, $token;
+          $total_chars += length($token);
+          if (length($token) > 2 && $token =~ /[a-zA-Z]/) {
+            $significant_tokens++;
+          }
+        }
+        
+        # Check quality criteria
+        if ($significant_tokens >= 1 && $total_chars >= 10) {
+          my $from_start = $all_deleted_tokens[$del_start]->{idx};
+          my $from_end = $all_deleted_tokens[$del_start + $max_match_length - 1]->{idx};
+          my $to_start = $all_added_tokens[$add_start]->{idx};
+          my $to_end = $all_added_tokens[$add_start + $max_match_length - 1]->{idx};
+          
+          # Mark as moved
+          for my $offset (0..$max_match_length-1) {
+            $old_marked[$all_deleted_tokens[$del_start + $offset]->{idx}] = 1;
+            $new_marked[$all_added_tokens[$add_start + $offset]->{idx}] = 1;
+          }
+          
+          push @moves, {
+            from_start => $from_start,
+            from_end => $from_end,
+            to_start => $to_start,
+            to_end => $to_end,
+            length => $max_match_length,
+            tokens => [@move_tokens]
+          };
+          
+          print STDERR "Detected token-level move (" . $max_match_length . " tokens): " . join(" ", @move_tokens) . "\n" if $verbose;
+        }
+      }
+    }
+  }
+  
+  print STDERR "Detected " . @moves . " moved passages\n" if $verbose;
   
   return {
     moves => \@moves,
     old_marked => \@old_marked,
     new_marked => \@new_marked
   };
+}
+
+# find_lcs(\@seq1, \@seq2, $keyfunc)
+# Find longest common subsequence between two sequences
+# Returns hash with matches array containing {del_idx => x, add_idx => y} pairs
+sub find_lcs {
+  my ($seq1, $seq2, $keyfunc) = @_;
+  my @seq1 = @$seq1;
+  my @seq2 = @$seq2;
+  
+  # Build LCS table
+  my @lcs_table;
+  for my $i (0..@seq1) {
+    for my $j (0..@seq2) {
+      $lcs_table[$i][$j] = 0;
+    }
+  }
+  
+  # Fill the LCS table
+  for my $i (1..@seq1) {
+    for my $j (1..@seq2) {
+      my $key1 = $keyfunc->($seq1[$i-1]);
+      my $key2 = $keyfunc->($seq2[$j-1]);
+      
+      if ($key1 eq $key2) {
+        $lcs_table[$i][$j] = $lcs_table[$i-1][$j-1] + 1;
+      } else {
+        $lcs_table[$i][$j] = ($lcs_table[$i-1][$j] > $lcs_table[$i][$j-1]) 
+                              ? $lcs_table[$i-1][$j] 
+                              : $lcs_table[$i][$j-1];
+      }
+    }
+  }
+  
+  # Backtrack to find the actual matches
+  my @matches;
+  my $i = @seq1;
+  my $j = @seq2;
+  
+  while ($i > 0 && $j > 0) {
+    my $key1 = $keyfunc->($seq1[$i-1]);
+    my $key2 = $keyfunc->($seq2[$j-1]);
+    
+    if ($key1 eq $key2) {
+      unshift @matches, { del_idx => $i-1, add_idx => $j-1 };
+      $i--;
+      $j--;
+    } elsif ($lcs_table[$i-1][$j] > $lcs_table[$i][$j-1]) {
+      $i--;
+    } else {
+      $j--;
+    }
+  }
+  
+  return { matches => \@matches };
+}
+
+# find_contiguous_ranges(\@matches, $index_func)
+# Find contiguous ranges in a sequence of matches
+# Returns array of {start => x, end => y, length => z} hashes
+sub find_contiguous_ranges {
+  my ($matches, $index_func) = @_;
+  my @ranges;
+  
+  return \@ranges if !@$matches;
+  
+  my $current_start = $index_func->($matches->[0]);
+  my $current_end = $current_start;
+  my $last_idx = $current_start;
+  
+  for my $i (1..$#{$matches}) {
+    my $idx = $index_func->($matches->[$i]);
+    
+    if ($idx == $last_idx + 1) {
+      # Contiguous - extend current range
+      $current_end = $idx;
+    } else {
+      # Gap found - save current range and start new one
+      push @ranges, {
+        start => $current_start,
+        end => $current_end,
+        length => $current_end - $current_start + 1
+      };
+      $current_start = $idx;
+      $current_end = $idx;
+    }
+    $last_idx = $idx;
+  }
+  
+  # Don't forget the last range
+  push @ranges, {
+    start => $current_start,
+    end => $current_end,
+    length => $current_end - $current_start + 1
+  };
+  
+  return \@ranges;
 }
 
 # pass2( \@seq1,\@seq2)
@@ -2744,24 +3087,29 @@ sub pass2 {
   # Detect moves first
   print STDERR "Detecting moved passages... " if $verbose;
   my $move_info = detect_moves($seq1, $seq2);
+  my @moves = @{$move_info->{moves}};
   my @old_marked = @{$move_info->{old_marked}};
   my @new_marked = @{$move_info->{new_marked}};
-  my @moves = @{$move_info->{moves}};
   
   if ($verbose) {
     my $move_count = @moves;
     print STDERR "found $move_count moved passages.\n";
   }
 
+  # Create hunks for move processing
+  my $movefromhunk = [];
+  my $movetohunk = [];
+
   my $discard = sub {
     my $idx = $_[0];
     # Check if this token is part of a move
     if ($old_marked[$idx]) {
-      # This is part of a moved passage, don't count as normal deletion
+      # This is part of a moved passage - add to move-from hunk
+      $movefromcnt++;
+      push( @$movefromhunk, $seq1->[ $_[0] ] );
       return;
     }
     $deltokcnt++;
-### print "DISCARD $_[0],$_[1]: $seq1->[$_[0]]\n";
     push( @$delhunk, $seq1->[ $_[0] ] );
   };
 
@@ -2769,18 +3117,18 @@ sub pass2 {
     my $idx = $_[1];
     # Check if this token is part of a move
     if ($new_marked[$idx]) {
-      # This is part of a moved passage, don't count as normal addition
+      # This is part of a moved passage - add to move-to hunk  
+      $movetocnt++;
+      push( @$movetohunk, $seq2->[ $_[1] ] );
       return;
     }
     $addtokcnt++;
-### print "APPEND $_[0],$_[1]: $seq2->[$_[1]]\n";
     push( @$addhunk, $seq2->[ $_[1] ] );
   };
 
   my $match = sub {
     $mattokcnt++;
     if ( scalar @$delhunk ) {
-### print "MATCH: adding delhunk size ", scalar @$delhunk,"\n" ;
       $delblkcnt++;
       # mark up changes, but comment out commands
       push @$retval,
@@ -2788,27 +3136,28 @@ sub pass2 {
       $delhunk = [];
     }
     if ( scalar @$addhunk ) {
-### print "MATCH: adding addhunk size ", scalar @$addhunk,"\n" ;
       $addblkcnt++;
       # we mark up changes, but simply quote commands
       push @$retval, marktags( $ADDMARKOPEN, $ADDMARKCLOSE, $ADDOPEN, $ADDCLOSE, "", "", $ADDCOMMENT, $addhunk );
       $addhunk = [];
     }
+    if ( scalar @$movefromhunk ) {
+      $movefromblkcnt++;
+      # mark up moved-from content
+      print STDERR "DEBUG: Processing movefromhunk with ", scalar @$movefromhunk, " tokens\n" if $verbose > 1;
+      push @$retval, marktags( $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, "", "", $MOVEFROMCOMMENT, $movefromhunk );
+      $movefromhunk = [];
+    }
+    if ( scalar @$movetohunk ) {
+      $movetoblkcnt++;
+      # mark up moved-to content
+      print STDERR "DEBUG: Processing movetohunk with ", scalar @$movetohunk, " tokens\n" if $verbose > 1;
+      push @$retval, marktags( $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE, "", "", $MOVETOCOMMENT, $movetohunk );
+      $movetohunk = [];
+    }
     push( @$retval, $seq2->[ $_[1] ] );
+    
     # Update DIFNOMARKUP counter
-    ### # save procedure
-    ### my $cnt_bnomarkup = scalar(grep { /^%BEGIN DIFNOMARKUP/ } @$retval);
-    ### my $cnt_enomarkup = scalar(grep { /^%END DIFNOMARKUP/ } @$retval);
-    ### if ( $cnt_bnomarkup == $cnt_enomarkup+1 && !$suppress_markup ) {
-    ###   $suppress_markup = 1;
-    ### } elsif ( $cnt_bnomarkup+1 == $cnt_enomarkup && $suppress_markup ) {
-    ###   $suppress_markup = 0;
-    ### } elsif { $cnt_bnomarkup == $cnt_enomarkup ) {
-    ###   pass;     # DIFNOMARKUP directives are paired appropriately
-    ### } else {
-    ###   print STDERR "WARNING: DIFNOMARKUP nesting incorrect. Using last value to determine next state irrespective of earlier state\n";
-    # shortcut relying on the last DIFNOMARKUP directive; this relies on proper nesting
-
     my @nomarkups = grep ( /^%(BEGIN|END) DIFNOMARKUP/, $seq2->[ $_[1] ] );
 
     if ( scalar @nomarkups ) {
@@ -2818,12 +3167,11 @@ sub pass2 {
         $suppress_markup = 0;
       }
     }
-    ###        }
   };
 
   my $keyfunc = sub { join( "  ", split( " ", shift() ) ) };
 
-  # Run normal diff on remaining (non-moved) tokens
+  # Run diff with move-aware callbacks
   traverse_sequences( $seq1, $seq2, { MATCH => $match, DISCARD_A => $discard, DISCARD_B => $add }, $keyfunc );
   
   # clear up unprocessed hunks
@@ -2832,69 +3180,14 @@ sub pass2 {
     if scalar @$delhunk;
   push @$retval, marktags( $ADDMARKOPEN, $ADDMARKCLOSE, $ADDOPEN, $ADDCLOSE, "", "", $ADDCOMMENT, $addhunk )
     if scalar @$addhunk;
-
-  # Now add move markup - Process moves and insert them in the correct positions
-  # We need to build the final result by going through both sequences and inserting moves at the right places
-  my @final_result = ();
-  my @sorted_moves = sort { $a->{to_start} <=> $b->{to_start} } @moves;
-  my $move_idx = 0;
-  my $result_idx = 0;
-  
-  # Insert moves at their "to" positions in the result
-  for my $i (0..$#{$retval}) {
-    # Check if we need to insert any moves before this position
-    while ($move_idx <= $#sorted_moves) {
-      my $move = $sorted_moves[$move_idx];
-      # Find the corresponding position in the result array
-      # This is approximate - in a full implementation we'd need better position tracking
-      
-      # Mark up the "moved from" location (insert before current position)
-      my @movefrom_tokens = @$seq1[$move->{from_start}..$move->{from_end}];
-      $movefromcnt += @movefrom_tokens;
-      $movefromblkcnt++;
-      push @final_result, marktags( 
-        $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, 
-        "", "", $MOVEFROMCOMMENT, \@movefrom_tokens 
-      );
-      
-      # Mark up the "moved to" location  
-      my @moveto_tokens = @$seq2[$move->{to_start}..$move->{to_end}];
-      $movetocnt += @moveto_tokens;
-      $movetoblkcnt++;
-      push @final_result, marktags(
-        $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE,
-        "", "", $MOVETOCOMMENT, \@moveto_tokens
-      );
-      
-      $move_idx++;
-      last; # Only process one move per position for now
-    }
-    
-    push @final_result, $retval->[$i];
-  }
-  
-  # Add any remaining moves
-  while ($move_idx <= $#sorted_moves) {
-    my $move = $sorted_moves[$move_idx];
-    
-    my @movefrom_tokens = @$seq1[$move->{from_start}..$move->{from_end}];
-    $movefromcnt += @movefrom_tokens;
-    $movefromblkcnt++;
-    push @final_result, marktags( 
-      $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, 
-      "", "", $MOVEFROMCOMMENT, \@movefrom_tokens 
-    );
-    
-    my @moveto_tokens = @$seq2[$move->{to_start}..$move->{to_end}];
-    $movetocnt += @moveto_tokens;
-    $movetoblkcnt++;
-    push @final_result, marktags(
-      $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE,
-      "", "", $MOVETOCOMMENT, \@moveto_tokens
-    );
-    
-    $move_idx++;
-  }
+  push @$retval, marktags( $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, "", "", $MOVEFROMCOMMENT, $movefromhunk )
+    if scalar @$movefromhunk;
+  push @$retval, marktags( $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE, "", "", $MOVETOCOMMENT, $movetohunk )
+    if scalar @$movetohunk;
+  push @$retval, marktags( $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, "", "", $MOVEFROMCOMMENT, $movefromhunk )
+    if scalar @$movefromhunk && do { print STDERR "DEBUG: Final movefromhunk with ", scalar @$movefromhunk, " tokens\n" if $verbose; 1 };
+  push @$retval, marktags( $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE, "", "", $MOVETOCOMMENT, $movetohunk )
+    if scalar @$movetohunk && do { print STDERR "DEBUG: Final movetohunk with ", scalar @$movetohunk, " tokens\n" if $verbose; 1 };
 
   if ($verbose) {
     print STDERR "\n";
@@ -2904,7 +3197,7 @@ sub pass2 {
     print STDERR "  $movefromcnt moved-from tokens in $movefromblkcnt blocks.\n";
     print STDERR "  $movetocnt moved-to tokens in $movetoblkcnt blocks.\n";
   }
-  return (@final_result);
+  return (@$retval);
 }
 
 # marktags($openmark,$closemark,$open,$close,$opencmd,$closecmd,$comment,\@block)
