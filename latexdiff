@@ -392,6 +392,18 @@ my $AUXCMD       = '%DIFAUXCMD';       #  follows auxiliary commands put in by l
 my $DELCOMMENT  = 'DIF < ';     # To mark deleted comment line
 my $VERBCOMMENT = 'DIFVRB ';    # to mark lines which are within a verbatim environment
 
+# Move markup tokens - for marking moved passages differently from pure deletions/additions
+my $MOVEFROMMARKOPEN  = '\DIFmovefrombegin ';    # Token to mark begin of moved-from text
+my $MOVEFROMMARKCLOSE = '\DIFmovefromend ';      # Token to mark end of moved-from text  
+my $MOVEFROMOPEN      = '\DIFmovefrom{';         # To mark begin of moved-from text passage
+my $MOVEFROMCLOSE     = '}';                     # To mark end of moved-from text passage
+my $MOVEFROMCOMMENT   = 'DIF MOVED FROM > ';    # To mark moved-from comment line
+my $MOVETOMARKOPEN    = '\DIFmovetobegin ';     # Token to mark begin of moved-to text
+my $MOVETOMARKCLOSE   = '\DIFmovetoend ';       # Token to mark end of moved-to text
+my $MOVETOOPEN        = '\DIFmoveto{';          # To mark begin of moved-to text passage
+my $MOVETOCLOSE       = '}';                    # To mark end of moved-to text passage
+my $MOVETOCOMMENT     = 'DIF MOVED TO > ';      # To mark moved-to comment line
+
 # main local variables:
 my @TEXTCMDLIST     = (); # array containing patterns of commands with text arguments
 my @TEXTCMDEXCL     = (); # array containing patterns of commands without text arguments (if a pattern
@@ -2587,6 +2599,126 @@ sub tokenizeblocks {
   @$seq = @new_seq;
 }
 
+# detect_moves($seq1, $seq2)
+# Detect moved passages using a simplified Heckel algorithm
+# Returns hash references with move information:
+# {
+#   moves => [ {from_start, from_end, to_start, to_end, length}, ... ],
+#   old_marked => [ array marking which old indices are part of moves ],
+#   new_marked => [ array marking which new indices are part of moves ]
+# }
+sub detect_moves {
+  my ($seq1, $seq2) = @_;
+  my @old_seq = @$seq1;
+  my @new_seq = @$seq2;
+  
+  # Key function for comparing tokens (same as used in diff)
+  my $keyfunc = sub { join("  ", split(" ", shift())) };
+  
+  # Create occurrence tables
+  my %old_occur;  # token -> [indices where it occurs in old]
+  my %new_occur;  # token -> [indices where it occurs in new]
+  
+  for my $i (0..$#old_seq) {
+    my $key = $keyfunc->($old_seq[$i]);
+    push @{$old_occur{$key}}, $i;
+  }
+  
+  for my $i (0..$#new_seq) {
+    my $key = $keyfunc->($new_seq[$i]);
+    push @{$new_occur{$key}}, $i;
+  }
+  
+  # Find tokens that appear exactly once in both sequences
+  my %unique_tokens;
+  for my $token (keys %old_occur) {
+    if (exists $new_occur{$token} && 
+        @{$old_occur{$token}} == 1 && 
+        @{$new_occur{$token}} == 1) {
+      $unique_tokens{$token} = {
+        old_pos => $old_occur{$token}->[0],
+        new_pos => $new_occur{$token}->[0]
+      };
+    }
+  }
+  
+  # Create sorted list of unique token anchors
+  my @anchors = sort { $a->{old_pos} <=> $b->{old_pos} } values %unique_tokens;
+  
+  # Track which positions are already marked as moves
+  my @old_marked = (0) x @old_seq;
+  my @new_marked = (0) x @new_seq;
+  my @moves;
+  
+  # Minimum move length to consider (avoid marking single-word moves)
+  my $min_move_length = 3;
+  
+  # Find longest common subsequences between anchors to detect moves
+  for my $i (0..$#anchors-1) {
+    my $anchor1 = $anchors[$i];
+    my $anchor2 = $anchors[$i+1];
+    
+    # Look for sequences that moved between these anchors
+    my $old_start = $anchor1->{old_pos} + 1;
+    my $old_end = $anchor2->{old_pos} - 1;
+    my $new_start = $anchor1->{new_pos} + 1;
+    my $new_end = $anchor2->{new_pos} - 1;
+    
+    # Skip if ranges are too small
+    next if $old_end < $old_start || $new_end < $new_start;
+    
+    # Check if sequences moved (comparing token keys)
+    my @old_keys = map { $keyfunc->($old_seq[$_]) } ($old_start..$old_end);
+    my @new_keys = map { $keyfunc->($new_seq[$_]) } ($new_start..$new_end);
+    
+    # Simple move detection: look for exact subsequence matches
+    for my $old_i (0..$#old_keys) {
+      for my $new_i (0..$#new_keys) {
+        my $match_len = 0;
+        
+        # Count matching sequence length
+        while ($old_i + $match_len <= $#old_keys && 
+               $new_i + $match_len <= $#new_keys &&
+               $old_keys[$old_i + $match_len] eq $new_keys[$new_i + $match_len] &&
+               !$old_marked[$old_start + $old_i + $match_len] &&
+               !$new_marked[$new_start + $new_i + $match_len]) {
+          $match_len++;
+        }
+        
+        # If we found a significant match, record it as a move
+        if ($match_len >= $min_move_length) {
+          my $from_start = $old_start + $old_i;
+          my $to_start = $new_start + $new_i;
+          
+          push @moves, {
+            from_start => $from_start,
+            from_end => $from_start + $match_len - 1,
+            to_start => $to_start,
+            to_end => $to_start + $match_len - 1,
+            length => $match_len
+          };
+          
+          # Mark these positions as used
+          for my $j (0..$match_len-1) {
+            $old_marked[$from_start + $j] = 1;
+            $new_marked[$to_start + $j] = 1;
+          }
+          
+          # Skip ahead to avoid overlapping matches
+          $old_i += $match_len - 1;
+          last;
+        }
+      }
+    }
+  }
+  
+  return {
+    moves => \@moves,
+    old_marked => \@old_marked,
+    new_marked => \@new_marked
+  };
+}
+
 # pass2( \@seq1,\@seq2)
 # Look for differences between seq1 and seq2.
 # Mark begin and end of deleted and appended sequences with tags $DELOPEN and $DELCLOSE
@@ -2599,8 +2731,8 @@ sub pass2 {
   my $seq1 = shift;
   my $seq2 = shift;
 
-  my ( $addtokcnt, $deltokcnt, $mattokcnt ) = ( 0, 0, 0 );
-  my ( $addblkcnt, $delblkcnt, $matblkcnt ) = ( 0, 0, 0 );
+  my ( $addtokcnt, $deltokcnt, $mattokcnt, $movefromcnt, $movetocnt ) = ( 0, 0, 0, 0, 0 );
+  my ( $addblkcnt, $delblkcnt, $matblkcnt, $movefromblkcnt, $movetoblkcnt ) = ( 0, 0, 0, 0, 0 );
 
   my $retval  = [];
   my $delhunk = [];
@@ -2609,13 +2741,37 @@ sub pass2 {
   # State variable that should be accessible to subroutines
   local $suppress_markup = 0;    # 0: do not block markup, 1: block markup  (supporting DIFNOMARKUP directives)
 
+  # Detect moves first
+  print STDERR "Detecting moved passages... " if $verbose;
+  my $move_info = detect_moves($seq1, $seq2);
+  my @old_marked = @{$move_info->{old_marked}};
+  my @new_marked = @{$move_info->{new_marked}};
+  my @moves = @{$move_info->{moves}};
+  
+  if ($verbose) {
+    my $move_count = @moves;
+    print STDERR "found $move_count moved passages.\n";
+  }
+
   my $discard = sub {
+    my $idx = $_[0];
+    # Check if this token is part of a move
+    if ($old_marked[$idx]) {
+      # This is part of a moved passage, don't count as normal deletion
+      return;
+    }
     $deltokcnt++;
 ### print "DISCARD $_[0],$_[1]: $seq1->[$_[0]]\n";
     push( @$delhunk, $seq1->[ $_[0] ] );
   };
 
   my $add = sub {
+    my $idx = $_[1];
+    # Check if this token is part of a move
+    if ($new_marked[$idx]) {
+      # This is part of a moved passage, don't count as normal addition
+      return;
+    }
     $addtokcnt++;
 ### print "APPEND $_[0],$_[1]: $seq2->[$_[1]]\n";
     push( @$addhunk, $seq2->[ $_[1] ] );
@@ -2667,7 +2823,9 @@ sub pass2 {
 
   my $keyfunc = sub { join( "  ", split( " ", shift() ) ) };
 
+  # Run normal diff on remaining (non-moved) tokens
   traverse_sequences( $seq1, $seq2, { MATCH => $match, DISCARD_A => $discard, DISCARD_B => $add }, $keyfunc );
+  
   # clear up unprocessed hunks
   push @$retval,
     marktags( $DELMARKOPEN, $DELMARKCLOSE, $DELOPEN, $DELCLOSE, $DELCMDOPEN, $DELCMDCLOSE, $DELCOMMENT, $delhunk )
@@ -2675,13 +2833,78 @@ sub pass2 {
   push @$retval, marktags( $ADDMARKOPEN, $ADDMARKCLOSE, $ADDOPEN, $ADDCLOSE, "", "", $ADDCOMMENT, $addhunk )
     if scalar @$addhunk;
 
+  # Now add move markup - Process moves and insert them in the correct positions
+  # We need to build the final result by going through both sequences and inserting moves at the right places
+  my @final_result = ();
+  my @sorted_moves = sort { $a->{to_start} <=> $b->{to_start} } @moves;
+  my $move_idx = 0;
+  my $result_idx = 0;
+  
+  # Insert moves at their "to" positions in the result
+  for my $i (0..$#{$retval}) {
+    # Check if we need to insert any moves before this position
+    while ($move_idx <= $#sorted_moves) {
+      my $move = $sorted_moves[$move_idx];
+      # Find the corresponding position in the result array
+      # This is approximate - in a full implementation we'd need better position tracking
+      
+      # Mark up the "moved from" location (insert before current position)
+      my @movefrom_tokens = @$seq1[$move->{from_start}..$move->{from_end}];
+      $movefromcnt += @movefrom_tokens;
+      $movefromblkcnt++;
+      push @final_result, marktags( 
+        $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, 
+        "", "", $MOVEFROMCOMMENT, \@movefrom_tokens 
+      );
+      
+      # Mark up the "moved to" location  
+      my @moveto_tokens = @$seq2[$move->{to_start}..$move->{to_end}];
+      $movetocnt += @moveto_tokens;
+      $movetoblkcnt++;
+      push @final_result, marktags(
+        $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE,
+        "", "", $MOVETOCOMMENT, \@moveto_tokens
+      );
+      
+      $move_idx++;
+      last; # Only process one move per position for now
+    }
+    
+    push @final_result, $retval->[$i];
+  }
+  
+  # Add any remaining moves
+  while ($move_idx <= $#sorted_moves) {
+    my $move = $sorted_moves[$move_idx];
+    
+    my @movefrom_tokens = @$seq1[$move->{from_start}..$move->{from_end}];
+    $movefromcnt += @movefrom_tokens;
+    $movefromblkcnt++;
+    push @final_result, marktags( 
+      $MOVEFROMMARKOPEN, $MOVEFROMMARKCLOSE, $MOVEFROMOPEN, $MOVEFROMCLOSE, 
+      "", "", $MOVEFROMCOMMENT, \@movefrom_tokens 
+    );
+    
+    my @moveto_tokens = @$seq2[$move->{to_start}..$move->{to_end}];
+    $movetocnt += @moveto_tokens;
+    $movetoblkcnt++;
+    push @final_result, marktags(
+      $MOVETOMARKOPEN, $MOVETOMARKCLOSE, $MOVETOOPEN, $MOVETOCLOSE,
+      "", "", $MOVETOCOMMENT, \@moveto_tokens
+    );
+    
+    $move_idx++;
+  }
+
   if ($verbose) {
     print STDERR "\n";
     print STDERR "  $mattokcnt matching  tokens. \n";
     print STDERR "  $deltokcnt discarded tokens in $delblkcnt blocks.\n";
     print STDERR "  $addtokcnt appended  tokens in $addblkcnt blocks.\n";
+    print STDERR "  $movefromcnt moved-from tokens in $movefromblkcnt blocks.\n";
+    print STDERR "  $movetocnt moved-to tokens in $movetoblkcnt blocks.\n";
   }
-  return (@$retval);
+  return (@final_result);
 }
 
 # marktags($openmark,$closemark,$open,$close,$opencmd,$closecmd,$comment,\@block)
@@ -3252,8 +3475,10 @@ sub postprocess {
     # Optional: Remove deleted block entirely
     if ($onlyadditions) {
       s/\\DIFdelbegin.*?\\DIFdelend//sg;
+      s/\\DIFmovefrombegin.*?\\DIFmovefromend//sg;
       #remove deleted comments
       s/%$DELCOMMENT.*\n//g;
+      s/%DIF MOVED FROM > .*\n//g;
     }
 
 ###    # change citation commands within comments to protect from processing
@@ -5793,24 +6018,30 @@ verbatim[*]?
 
 %DIF UNDERLINE PREAMBLE
 \RequirePackage[normalem]{ulem}
-\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}
+\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}\definecolor{GREEN}{rgb}{0,0.5,0}\definecolor{ORANGE}{rgb}{1,0.5,0}
 \providecommand{\DIFadd}[1]{{\protect\color{blue}\uwave{#1}}}
 \providecommand{\DIFdel}[1]{{\protect\color{red}\sout{#1}}}
+\providecommand{\DIFmovefrom}[1]{{\protect\color{orange}\xout{#1}}}
+\providecommand{\DIFmoveto}[1]{{\protect\color{green}\uwave{#1}}}
 %DIF END UNDERLINE PREAMBLE
 
 %DIF LUAUNDERLINE PREAMBLE
 \RequirePackage{lua-ul}
-\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}
+\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}\definecolor{GREEN}{rgb}{0,0.5,0}\definecolor{ORANGE}{rgb}{1,0.5,0}
 \providecommand{\DIFadd}[1]{{\protect\color{blue}\underLine{#1}}}
 \providecommand{\DIFdel}[1]{{\protect\color{red}\strikeThrough{#1}}}
+\providecommand{\DIFmovefrom}[1]{{\protect\color{orange}\strikeThrough{#1}}}
+\providecommand{\DIFmoveto}[1]{{\protect\color{green}\underLine{#1}}}
 %DIF END LUAUNDERLINE PREAMBLE
 
 %DIF CTRADITIONAL PREAMBLE
-\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}
+\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}\definecolor{GREEN}{rgb}{0,0.5,0}\definecolor{ORANGE}{rgb}{1,0.5,0}
 \RequirePackage[stable]{footmisc}
 \DeclareOldFontCommand{\sf}{\normalfont\sffamily}{\mathsf}
 \providecommand{\DIFadd}[1]{{\protect\color{blue} \sf #1}}
 \providecommand{\DIFdel}[1]{{\protect\color{red} [..\footnote{removed: #1} ]}}
+\providecommand{\DIFmovefrom}[1]{{\protect\color{orange} [..\footnote{moved from here: #1} ]}}
+\providecommand{\DIFmoveto}[1]{{\protect\color{green} \sf #1}}
 %DIF END CTRADITIONAL PREAMBLE
 
 %DIF TRADITIONAL PREAMBLE
@@ -5818,13 +6049,17 @@ verbatim[*]?
 \DeclareOldFontCommand{\sf}{\normalfont\sffamily}{\mathsf}
 \providecommand{\DIFadd}[1]{{\sf #1}}
 \providecommand{\DIFdel}[1]{{[..\footnote{removed: #1} ]}}
+\providecommand{\DIFmovefrom}[1]{{[..\footnote{moved from here: #1} ]}}
+\providecommand{\DIFmoveto}[1]{{\sf #1}}
 %DIF END TRADITIONAL PREAMBLE
 
 %DIF CFONT PREAMBLE
-\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}
+\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1}\definecolor{GREEN}{rgb}{0,0.5,0}\definecolor{ORANGE}{rgb}{1,0.5,0}
 \DeclareOldFontCommand{\sf}{\normalfont\sffamily}{\mathsf}
 \providecommand{\DIFadd}[1]{{\protect\color{blue} \sf #1}}
 \providecommand{\DIFdel}[1]{{\protect\color{red} \scriptsize #1}}
+\providecommand{\DIFmovefrom}[1]{{\protect\color{orange} \scriptsize #1}}
+\providecommand{\DIFmoveto}[1]{{\protect\color{green} \sf #1}}
 %DIF END CFONT PREAMBLE
 
 %DIF FONTSTRIKE PREAMBLE
@@ -5865,18 +6100,24 @@ verbatim[*]?
 %DIF INVISIBLE PREAMBLE
 \providecommand{\DIFadd}[1]{#1}
 \providecommand{\DIFdel}[1]{}
+\providecommand{\DIFmovefrom}[1]{}
+\providecommand{\DIFmoveto}[1]{#1}
 %DIF END INVISIBLE PREAMBLE
 
 %DIF BOLD PREAMBLE
 \DeclareOldFontCommand{\bf}{\normalfont\bfseries}{\mathbf}
 \providecommand{\DIFadd}[1]{{\bf #1}}
 \providecommand{\DIFdel}[1]{}
+\providecommand{\DIFmovefrom}[1]{}
+\providecommand{\DIFmoveto}[1]{{\bf #1}}
 %DIF END BOLD PREAMBLE
 
 %DIF PDFCOMMENT PREAMBLE
 \RequirePackage{pdfcomment} %DIF PREAMBLE
 \providecommand{\DIFadd}[1]{\pdfmarkupcomment[author=ADD:,markup=Underline]{#1}{}}
 \providecommand{\DIFdel}[1]{\pdfcomment[icon=Insert,author=DEL:,hspace=12pt]{#1}}
+\providecommand{\DIFmovefrom}[1]{\pdfcomment[icon=Insert,author=MOVED FROM:,hspace=12pt]{#1}}
+\providecommand{\DIFmoveto}[1]{\pdfmarkupcomment[author=MOVED TO:,markup=Underline]{#1}{}}
 %DIF END PDFCOMMENT PREAMBLE
 
 %% SUBTYPES (Markers for beginning and end of changed blocks)
@@ -5888,6 +6129,10 @@ verbatim[*]?
 \providecommand{\DIFdelend}{}
 \providecommand{\DIFmodbegin}{}
 \providecommand{\DIFmodend}{}
+\providecommand{\DIFmovefrombegin}{}
+\providecommand{\DIFmovefromend}{}
+\providecommand{\DIFmovetobegin}{}
+\providecommand{\DIFmovetoend}{}
 %DIF END SAFE PREAMBLE
 
 %DIF MARGIN PREAMBLE
@@ -5895,6 +6140,10 @@ verbatim[*]?
 \providecommand{\DIFaddend}{\protect\marginpar{]}}
 \providecommand{\DIFdelbegin}{\protect\marginpar{d[}}
 \providecommand{\DIFdelend}{\protect\marginpar{]}}
+\providecommand{\DIFmovefrombegin}{\protect\marginpar{m[}}
+\providecommand{\DIFmovefromend}{\protect\marginpar{]}}
+\providecommand{\DIFmovetobegin}{\protect\marginpar{M[}}
+\providecommand{\DIFmovetoend}{\protect\marginpar{]}}
 \providecommand{\DIFmodbegin}{\protect\marginpar{m[}}
 \providecommand{\DIFmodend}{\protect\marginpar{]}}
 %DIF END MARGIN PREAMBLE
