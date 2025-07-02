@@ -784,7 +784,42 @@ class LaTeXDiff:
         # hacky fix for some other issues
         str_result = str_result.replace(r"\DIFdel{*}", "").replace(r"\DIFadd{*}", "")
 
+        # Fix whitespace issues between environment starts and content
+        str_result = self._fix_environment_whitespace(str_result)
+
         return str_result
+
+    def _fix_environment_whitespace(self, text: str) -> str:
+        """Fix whitespace issues around LaTeX environments"""
+        # Get all environments that commonly have whitespace issues
+        problematic_envs = (
+            self.parser.math_environments
+            | {"theorem", "lemma", "proof", "definition", "corollary"}
+            | {"itemize", "enumerate", "description"}
+            | {"figure", "figure*", "table", "table*", "tabular"}
+            | {"abstract", "quote", "quotation", "center", "verbatim"}
+        )
+
+        # Fix extra whitespace after \begin{env}
+        for env in problematic_envs:
+            # Handle both starred and non-starred versions
+            if env.endswith("*"):
+                # Already includes the star
+                pattern = rf"(\\begin\{{{re.escape(env)}\}})\s*\n\s*\n"
+            else:
+                # Handle both regular and starred versions
+                pattern = rf"(\\begin\{{{re.escape(env)}\*?\}})\s*\n\s*\n"
+            text = re.sub(pattern, r"\1\n", text)
+
+        # Fix extra whitespace before \end{env} for math environments
+        for env in self.parser.math_environments:
+            if env.endswith("*"):
+                pattern = rf"\n\s*\n\s*(\\end\{{{re.escape(env)}\}})"
+            else:
+                pattern = rf"\n\s*\n\s*(\\end\{{{re.escape(env)}\*?\}})"
+            text = re.sub(pattern, r"\n\1", text)
+
+        return text
 
     def _is_safe_for_markup(self, content: str) -> bool:
         """Check if content is safe to wrap in diff markup"""
