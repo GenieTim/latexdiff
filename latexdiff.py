@@ -857,11 +857,38 @@ class LaTeXDiff:
         if re.match(r"\\label\{[^}]*\}$", content.strip()):
             return False
 
-        # Don't markup content that contains math delimiters
-        if "$" in content:
+        # Check for problematic math patterns more carefully
+        if self._contains_problematic_math(content):
             return False
 
         return True
+
+    def _contains_problematic_math(self, content: str) -> bool:
+        """Check if content contains math patterns that would break when wrapped in markup"""
+        # Don't markup if the entire content is just a math expression
+        content_stripped = content.strip()
+
+        # Check if it's purely a math expression (starts and ends with $)
+        if content_stripped.startswith("$") and content_stripped.endswith("$"):
+            return True
+
+        # Check if it's purely display math
+        if content_stripped.startswith("$$") and content_stripped.endswith("$$"):
+            return True
+
+        # Check for unmatched math delimiters that could break markup
+        dollar_count = content.count("$")
+        if dollar_count % 2 != 0:
+            # Odd number of $ symbols suggests unmatched delimiters
+            return True
+
+        # Check for math at the very beginning or end that might break
+        if content_stripped.startswith("$") and not content_stripped.endswith("$"):
+            return True
+        if content_stripped.endswith("$") and not content_stripped.startswith("$"):
+            return True
+
+        return False
 
     def _has_balanced_braces(self, text: str) -> bool:
         """Check if braces are balanced in the text"""
