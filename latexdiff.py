@@ -18,7 +18,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from mdiff import diff_lines_with_similarities
 
@@ -58,73 +58,74 @@ class LaTeXEnvironmentParser:
     def __init__(self):
         # Math environments that should never be split
         self.math_environments = {
-            "equation",
-            "equation*",
             "align",
             "align*",
             "alignat",
             "alignat*",
-            "gather",
-            "gather*",
-            "multline",
-            "multline*",
-            "flalign",
-            "flalign*",
+            "array",
+            "bmatrix",
+            "cases",
+            "displaymath",
             "eqnarray",
             "eqnarray*",
-            "displaymath",
+            "equation",
+            "equation*",
+            "flalign",
+            "flalign*",
+            "gather",
+            "gather*",
             "math",
-            "array",
             "matrix",
+            "multline",
+            "multline*",
             "pmatrix",
-            "bmatrix",
-            "vmatrix",
-            "Vmatrix",
             "smallmatrix",
-            "cases",
             "split",
             "subequations",
+            "vmatrix",
+            "Vmatrix",
         }
 
         # Block environments that should be treated as units
         self.block_environments = {
+            # "abstract",
+            "algorithm",
+            "algorithmic",
+            "center",
+            "corollary",
+            "definition",
+            "description",
+            "enumerate",
+            "example",
             "figure",
             "figure*",
+            "flushleft",
+            "flushright",
+            "itemize",
+            "lemma",
+            "longtable",
+            "lstlisting",
+            "minted",
+            "note",
+            "proof",
+            "quotation",
+            "quote",
+            "remark",
             "table",
             "table*",
             "tabular",
             "tabularx",
-            "longtable",
             "theorem",
-            "proof",
-            "definition",
-            "lemma",
-            "corollary",
-            "example",
-            "remark",
-            "note",
             "verbatim",
-            "lstlisting",
-            "minted",
-            "algorithmic",
-            "algorithm",
-            "center",
-            "flushleft",
-            "flushright",
-            "quote",
-            "quotation",
-            "itemize",
-            "enumerate",
-            "description",
         }
 
         # Commands that should not be split
         self.protected_commands = {
             "ref",
             "label",
-            "cite",
-            "citep",
-            "citet",
+            # "cite",
+            # "citep",
+            # "citet",
             "bibliography",
             "bibliographystyle",
             "include",
@@ -168,7 +169,6 @@ class LaTeXEnvironmentParser:
 
                 # Find the complete environment
                 env_name = env_match.group(1)
-                env_start = i
                 env_content, env_end = self._extract_environment(text, i, env_name)
 
                 # Determine if this environment should be protected
@@ -199,20 +199,14 @@ class LaTeXEnvironmentParser:
                     current_block = ""
 
                 # Find end of display math
-                math_start = i
-                i += 2
-                while i < len(text) - 1:
-                    if text[i : i + 2] == "$$":
-                        i += 2
-                        break
-                    i += 1
-
+                math_content, math_end = self._extract_math_block(text, i, "$$")
                 blocks.append(
-                    {"type": "math", "content": text[math_start:i], "protected": True}
+                    {"type": "math", "content": math_content, "protected": True}
                 )
+                i = math_end
                 continue
 
-            elif text[i] == "$":
+            elif text[i] == "$" and (i == 0 or text[i - 1] != "\\"):
                 # Flush current block
                 if current_block.strip():
                     blocks.append(
@@ -221,17 +215,11 @@ class LaTeXEnvironmentParser:
                     current_block = ""
 
                 # Find end of inline math
-                math_start = i
-                i += 1
-                while i < len(text):
-                    if text[i] == "$" and (i == 0 or text[i - 1] != "\\"):
-                        i += 1
-                        break
-                    i += 1
-
+                math_content, math_end = self._extract_math_block(text, i, "$")
                 blocks.append(
-                    {"type": "math", "content": text[math_start:i], "protected": True}
+                    {"type": "math", "content": math_content, "protected": True}
                 )
+                i = math_end
                 continue
 
             # Check for commands
@@ -304,6 +292,46 @@ class LaTeXEnvironmentParser:
         # If we reach here, environment was not properly closed
         return text[start:], len(text)
 
+    def _extract_math_block(
+        self, text: str, start: int, delimiter: str
+    ) -> Tuple[str, int]:
+        """Extract complete math block with proper delimiter handling"""
+        i = start
+
+        if delimiter == "$$":
+            # Display math
+            i += 2  # Skip opening $$
+            start_content = i
+
+            while i < len(text) - 1:
+                if text[i : i + 2] == "$$":
+                    # Found closing $$
+                    math_content = text[start : i + 2]  # Include delimiters
+                    return math_content, i + 2
+                elif text[i] == "\\" and i + 1 < len(text):
+                    # Skip escaped characters
+                    i += 2
+                else:
+                    i += 1
+        else:
+            # Inline math with single $
+            i += 1  # Skip opening $
+            start_content = i
+
+            while i < len(text):
+                if text[i] == "$" and (i == 0 or text[i - 1] != "\\"):
+                    # Found unescaped closing $
+                    math_content = text[start : i + 1]  # Include delimiters
+                    return math_content, i + 1
+                elif text[i] == "\\" and i + 1 < len(text):
+                    # Skip escaped characters
+                    i += 2
+                else:
+                    i += 1
+
+        # If we reach here, math was not properly closed
+        return text[start:], len(text)
+
     def split_text_block(self, text: str) -> List[str]:
         """Split a text block into smaller units while preserving LaTeX structure"""
         # Split by paragraphs (double newlines) and sentence boundaries
@@ -342,25 +370,8 @@ class LaTeXDiff:
     def _generate_diff_preamble(self) -> str:
         """Generate the preamble additions for diff markup"""
         preamble_file = os.path.join(os.path.dirname(__file__), "diff_preamble.tex")
-        if os.path.exists(preamble_file):
-            with open(preamble_file, "r") as f:
-                return f.read()
-        else:
-            # Fallback preamble
-            return """
-% DIF PREAMBLE
-\\RequirePackage[normalem]{ulem}
-\\RequirePackage{color}
-\\definecolor{RED}{rgb}{1,0,0}
-\\definecolor{BLUE}{rgb}{0,0,1}
-\\definecolor{GREEN}{rgb}{0,0.5,0}
-\\definecolor{ORANGE}{rgb}{1,0.5,0}
-\\providecommand{\\DIFadd}[1]{{\\protect\\color{blue}\\uwave{#1}}}
-\\providecommand{\\DIFdel}[1]{{\\protect\\color{red}\\sout{#1}}}
-\\providecommand{\\DIFmovefrom}[1]{{\\protect\\color{orange}\\xout{#1}}}
-\\providecommand{\\DIFmoveto}[1]{{\\protect\\color{green}\\uwave{#1}}}
-% END DIF PREAMBLE
-"""
+        with open(preamble_file, "r") as f:
+            return f.read()
 
     def process_files(self, old_file: str, new_file: str) -> str:
         """Process two LaTeX files and return the diff markup"""
@@ -429,58 +440,65 @@ class LaTeXDiff:
             print(f"Old blocks: {len(old_blocks)}", file=sys.stderr)
             print(f"New blocks: {len(new_blocks)}", file=sys.stderr)
 
-        # Convert blocks to strings for comparison
-        old_strings = []
-        new_strings = []
-
-        for block in old_blocks:
-            if block["protected"]:
-                # Protected blocks are compared as single units
-                old_strings.append(block["content"])
-            else:
-                # Text blocks can be split further
-                sub_blocks = self.parser.split_text_block(block["content"])
-                old_strings.extend(sub_blocks)
-
-        for block in new_blocks:
-            if block["protected"]:
-                # Protected blocks are compared as single units
-                new_strings.append(block["content"])
-            else:
-                # Text blocks can be split further
-                sub_blocks = self.parser.split_text_block(block["content"])
-                new_strings.extend(sub_blocks)
+        # Convert blocks to comparison units
+        old_units = self._blocks_to_comparison_units(old_blocks)
+        new_units = self._blocks_to_comparison_units(new_blocks)
 
         # Use mdiff for comparison
-        try:
-            old_text = "\n".join(old_strings)
-            new_text = "\n".join(new_strings)
+        old_text = "\n".join(old_units)
+        new_text = "\n".join(new_units)
 
-            a_lines, b_lines, opcodes = diff_lines_with_similarities(
-                old_text,
-                new_text,
-                cutoff=0.6,
-                keepends=True,
-                case_sensitive=True,
-            )
+        a_lines, b_lines, opcodes = diff_lines_with_similarities(
+            old_text,
+            new_text,
+            cutoff=0.75,
+            keepends=True,
+            case_sensitive=True,
+        )
 
-            if self.config.debug:
-                print(f"Found {len(opcodes)} opcodes", file=sys.stderr)
+        if self.config.debug:
+            print(f"Found {len(opcodes)} opcodes", file=sys.stderr)
 
-            return self._process_opcodes_safely(a_lines, b_lines, opcodes)
+        return self._process_opcodes_safely(a_lines, b_lines, opcodes)
 
-        except Exception as e:
-            if self.config.debug:
-                print(
-                    f"mdiff failed: {e}, falling back to simple diff", file=sys.stderr
-                )
-            return self._simple_diff(old_strings, new_strings)
+    def _blocks_to_comparison_units(self, blocks: List[Dict]) -> List[str]:
+        """Convert blocks to units suitable for comparison"""
+        units = []
+
+        for block in blocks:
+            if (
+                block["type"] in ["math", "environment", "command"]
+                and block["protected"]
+            ):
+                # Protected blocks are treated as single units
+                units.append(block["content"])
+            else:
+                # Text blocks can be split further, but preserve structure
+                if block["type"] == "text":
+                    sub_units = self.parser.split_text_block(block["content"])
+                    units.extend(sub_units)
+                else:
+                    units.append(block["content"])
+
+        return units
+
+    def _adjust_content_before_wrapping_in_diff_commands(self, content: str) -> str:
+        if "%" in content:
+            return content + "\n"
+        return content
 
     def _process_opcodes_safely(
-        self, old_lines: List[str], new_lines: List[str], opcodes
+        self,
+        old_lines: Union[str, List[str]],
+        new_lines: Union[str, List[str]],
+        opcodes,
     ) -> str:
         """Process opcodes with LaTeX safety checks"""
         result = []
+
+        found_document = False
+        if "{document}" in "\n".join(old_lines) or "{document}" in "\n".join(new_lines):
+            found_document = True
 
         for opcode in opcodes:
             tag = opcode.tag
@@ -492,7 +510,12 @@ class LaTeXDiff:
             elif tag == "delete":
                 if not self.config.no_del:
                     deleted_content = old_lines[i1:i2]
+                    if isinstance(deleted_content, str):
+                        deleted_content = deleted_content.splitlines(keepends=True)
                     for content in deleted_content:
+                        content = self._adjust_content_before_wrapping_in_diff_commands(
+                            content
+                        )
                         if self._is_safe_for_markup(content):
                             result.append(f"\\DIFdel{{{content}}}")
                         else:
@@ -506,7 +529,12 @@ class LaTeXDiff:
 
             elif tag == "insert":
                 inserted_content = new_lines[j1:j2]
+                if isinstance(inserted_content, str):
+                    inserted_content = inserted_content.splitlines(keepends=True)
                 for content in inserted_content:
+                    content = self._adjust_content_before_wrapping_in_diff_commands(
+                        content
+                    )
                     if self._is_safe_for_markup(content):
                         result.append(f"\\DIFadd{{{content}}}")
                     else:
@@ -524,15 +552,50 @@ class LaTeXDiff:
                 new_content = new_lines[j1:j2]
 
                 # Check if we can safely markup the replacement
-                old_safe = all(self._is_safe_for_markup(c) for c in old_content)
-                new_safe = all(self._is_safe_for_markup(c) for c in new_content)
+                old_safe = all(
+                    self._is_safe_for_markup(c)
+                    for c in (
+                        old_content if isinstance(old_content, list) else [old_content]
+                    )
+                )
+                new_safe = all(
+                    self._is_safe_for_markup(c)
+                    for c in (
+                        new_content if isinstance(new_content, list) else [new_content]
+                    )
+                )
 
                 if old_safe and new_safe:
-                    if not self.config.no_del:
-                        for content in old_content:
-                            result.append(f"\\DIFdel{{{content}}}")
-                    for content in new_content:
-                        result.append(f"\\DIFadd{{{content}}}")
+                    # process sub
+                    if hasattr(opcode, "children_opcodes") and len(
+                        opcode.children_opcodes
+                    ):
+                        assert isinstance(old_lines, list)
+                        result.append(
+                            self._process_opcodes_safely(
+                                "\n".join(old_content),
+                                "\n".join(new_content),
+                                opcodes=opcode.children_opcodes,
+                            )
+                        )
+                    else:
+                        if not self.config.no_del:
+                            if isinstance(old_content, str):
+                                old_content = old_content.splitlines(keepends=True)
+                            for content in old_content:
+                                content = self._adjust_content_before_wrapping_in_diff_commands(
+                                    content
+                                )
+                                result.append(f"\\DIFdel{{{content}}}\n")
+                        if isinstance(new_content, str):
+                            new_content = new_content.splitlines(keepends=True)
+                        for content in new_content:
+                            content = (
+                                self._adjust_content_before_wrapping_in_diff_commands(
+                                    content
+                                )
+                            )
+                            result.append(f"\\DIFadd{{{content}}}\n")
                 else:
                     # Fallback: just use new content without markup
                     result.extend(new_content)
@@ -540,7 +603,12 @@ class LaTeXDiff:
             elif tag == "move":
                 if not self.config.no_del:
                     moved_content = old_lines[i1:i2]
+                    if isinstance(moved_content, str):
+                        moved_content = moved_content.splitlines(keepends=True)
                     for content in moved_content:
+                        content = self._adjust_content_before_wrapping_in_diff_commands(
+                            content
+                        )
                         if self._is_safe_for_markup(content):
                             result.append(f"\\DIFmovefrom{{{content}}}")
                         else:
@@ -548,13 +616,28 @@ class LaTeXDiff:
 
             elif tag == "moved":
                 moved_content = new_lines[j1:j2]
+                if isinstance(moved_content, str):
+                    moved_content = moved_content.splitlines(keepends=True)
                 for content in moved_content:
+                    content = self._adjust_content_before_wrapping_in_diff_commands(
+                        content
+                    )
                     if self._is_safe_for_markup(content):
                         result.append(f"\\DIFmoveto{{{content}}}")
                     else:
                         result.append(content)
 
-        return "".join(result)
+            if not isinstance(old_lines, str):
+                assert found_document and "{document}" in result[0]
+
+        str_result = "".join(result)
+        if found_document:
+            assert "{document}" in str_result, "Document tag not found in result"
+
+        # hacky fix for some other issues
+        str_result = str_result.replace(r"\DIFdel{*}", "").replace(r"\DIFadd{*}", "")
+
+        return str_result
 
     def _is_safe_for_markup(self, content: str) -> bool:
         """Check if content is safe to wrap in diff markup"""
@@ -568,8 +651,10 @@ class LaTeXDiff:
         if re.match(r"\\begin\{", content) or re.match(r"\\end\{", content):
             return False
 
-        # Don't markup math delimiters
-        if content.startswith("$") or content.endswith("$"):
+        # Don't markup math delimiters or complete math expressions
+        if (content.startswith("$") and content.endswith("$")) or content.startswith(
+            "$$"
+        ):
             return False
 
         # Don't markup if it contains unbalanced braces
@@ -580,8 +665,18 @@ class LaTeXDiff:
         if content.endswith("\\") or re.search(r"\\[a-zA-Z]+$", content):
             return False
 
+        # Don't markup images
+        if content.strip().startswith(
+            "\\includegraphics{"
+        ) or content.strip().startswith("\\includegraphics["):
+            return False
+
         # Don't markup isolated labels or equation numbers
         if re.match(r"\\label\{[^}]*\}$", content.strip()):
+            return False
+
+        # Don't markup content that contains math delimiters
+        if "$" in content:
             return False
 
         return True
@@ -608,29 +703,6 @@ class LaTeXDiff:
                     return False
 
         return depth == 0
-
-    def _simple_diff(self, old_strings: List[str], new_strings: List[str]) -> str:
-        """Simple fallback diff implementation"""
-        result = []
-
-        # Very basic approach: find common elements
-        old_set = set(old_strings)
-        new_set = set(new_strings)
-        common = old_set.intersection(new_set)
-
-        # Process old strings
-        for item in old_strings:
-            if item in common:
-                result.append(item)
-            elif not self.config.no_del and self._is_safe_for_markup(item):
-                result.append(f"\\DIFdel{{{item}}}")
-
-        # Add new strings that aren't common
-        for item in new_strings:
-            if item not in common and self._is_safe_for_markup(item):
-                result.append(f"\\DIFadd{{{item}}}")
-
-        return "".join(result)
 
     def _combine_diff_document(
         self, preamble: str, body: str, old_file: str, new_file: str
