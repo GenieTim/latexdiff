@@ -201,9 +201,18 @@ class LaTeXEnvironmentParser:
             # Protected nodes are treated as single units
             units.append(node.content)
         elif node.node_type == "environment" and not node.protected:
-            # Non-protected environments: process children
+            # Non-protected environments: include begin/end delimiters and process children
+            # Extract the environment name and add \begin{env}
+            if node.env_name:
+                units.append(f"\\begin{{{node.env_name}}}")
+
+            # Process children (the content inside the environment)
             for child in node.children:
                 self._collect_comparison_units(child, units)
+
+            # Add \end{env}
+            if node.env_name:
+                units.append(f"\\end{{{node.env_name}}}")
         elif node.node_type == "text":
             # Text nodes can be split further
             sub_units = self.split_text_block(node.content)
@@ -219,8 +228,39 @@ class LaTeXEnvironmentParser:
         self._collect_comparison_units(root, units)
         return units
 
+    def _remove_comments(self, text: str) -> str:
+        """Remove LaTeX comments from text, handling escaped % correctly"""
+        lines = text.split("\n")
+        processed_lines = []
+
+        for line in lines:
+            # Find the first unescaped %
+            i = 0
+            while i < len(line):
+                if line[i] == "%":
+                    # Check if it's escaped
+                    num_backslashes = 0
+                    j = i - 1
+                    while j >= 0 and line[j] == "\\":
+                        num_backslashes += 1
+                        j -= 1
+
+                    # If even number of backslashes (including 0), % is not escaped
+                    if num_backslashes % 2 == 0:
+                        # This % starts a comment, truncate the line here
+                        line = line[:i]
+                        break
+                i += 1
+
+            processed_lines.append(line)
+
+        return "\n".join(processed_lines)
+
     def parse_into_tree(self, text: str) -> LaTeXNode:
         """Parse text into a hierarchical tree structure"""
+        # Remove comments before parsing
+        text = self._remove_comments(text)
+
         root = LaTeXNode(
             node_type="document", content="", start_pos=0, end_pos=len(text)
         )
@@ -464,6 +504,9 @@ class LaTeXEnvironmentParser:
 
     def split_text_block(self, text: str) -> List[str]:
         """Split a text block into smaller units while preserving LaTeX structure"""
+        # Remove comments before splitting
+        text = self._remove_comments(text)
+
         # Split by paragraphs (double newlines) and sentence boundaries
         paragraphs = re.split(r"\n\s*\n", text)
 
