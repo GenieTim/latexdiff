@@ -630,7 +630,7 @@ class LaTeXDiff:
             new_text,
             cutoff=0.75,
             keepends=True,
-            case_sensitive=True,
+            case_sensitive=False,
         )
 
         if self.config.debug:
@@ -657,7 +657,7 @@ class LaTeXDiff:
             i1, i2, j1, j2 = opcode.i1, opcode.i2, opcode.j1, opcode.j2
 
             if tag == "equal":
-                result.extend(old_lines[i1:i2])
+                result.extend(new_lines[j1:j2])
 
             elif tag == "delete":
                 if not self.config.no_del:
@@ -818,6 +818,14 @@ class LaTeXDiff:
             else:
                 pattern = rf"\n\s*\n\s*(\\end\{{{re.escape(env)}\*?\}})"
             text = re.sub(pattern, r"\n\1", text)
+
+        # Fix whitespace issues around diff commands
+        for diff_cmd in self.markup_commands.values():
+            pattern = rf"({re.escape(diff_cmd)}[a-zA-Z\s\.,:;]*)\n}}\$"
+            text = re.sub(pattern, r"\1}$", text)
+
+        pattern = r"\\DIFdel\{([a-zA-Z0-9 ]*)\}\n\\DIFadd\{([a-zA-Z0-9 ]*)\}\n([a-z])"
+        text = re.sub(pattern, r"\\DIFdel{\1}\\DIFadd{\2}\3", text)
 
         return text
 
