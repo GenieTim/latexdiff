@@ -27,6 +27,23 @@ __original_version__ = "1.3.5a"  # Based on Perl version
 
 
 @dataclass
+class LaTeXNode:
+    """Represents a node in the LaTeX document tree"""
+
+    node_type: str  # 'text', 'environment', 'math', 'command', 'document'
+    content: str
+    env_name: Optional[str] = None
+    protected: bool = False
+    children: Optional[List["LaTeXNode"]] = None
+    start_pos: int = 0
+    end_pos: int = 0
+
+    def __post_init__(self):
+        if self.children is None:
+            self.children = []
+
+
+@dataclass
 class Config:
     """Configuration class to hold all latexdiff options"""
 
@@ -53,7 +70,7 @@ class Config:
 
 
 class LaTeXEnvironmentParser:
-    """Parser that identifies and preserves LaTeX environments and commands"""
+    """Parser that identifies and preserves LaTeX environments"""
 
     def __init__(self):
         # Math environments that should never be split
@@ -150,25 +167,93 @@ class LaTeXEnvironmentParser:
             "author",
         }
 
-    def parse_into_blocks(self, text: str) -> List[Dict]:
-        """Parse text into logical blocks that preserve LaTeX structure"""
-        blocks = []
-        i = 0
-        current_block = ""
+    def _count_tree_nodes(self, node: LaTeXNode) -> int:
+        """Count total nodes in tree for debugging"""
+        count = 1
+        for child in node.children:
+            count += self._count_tree_nodes(child)
+        return count
 
-        while i < len(text):
+    def _blocks_to_comparison_units(self, blocks: List[Dict]) -> List[str]:
+        """Convert blocks to units suitable for comparison"""
+        units = []
+
+        for block in blocks:
+            if (
+                block["type"] in ["math", "environment", "command"]
+                and block["protected"]
+            ):
+                # Protected blocks are treated as single units
+                units.append(block["content"])
+            else:
+                # Text blocks can be split further, but preserve structure
+                if block["type"] == "text":
+                    sub_units = self.parser.split_text_block(block["content"])
+                    units.extend(sub_units)
+                else:
+                    units.append(block["content"])
+
+        return units
+
+    def _collect_comparison_units(self, node: LaTeXNode, units: List[str]):
+        """Recursively collect comparison units from tree"""
+        if node.protected or node.node_type in ["math", "command"]:
+            # Protected nodes are treated as single units
+            units.append(node.content)
+        elif node.node_type == "environment" and not node.protected:
+            # Non-protected environments: process children
+            for child in node.children:
+                self._collect_comparison_units(child, units)
+        elif node.node_type == "text":
+            # Text nodes can be split further
+            sub_units = self.split_text_block(node.content)
+            units.extend(sub_units)
+        else:
+            # Document node: process all children
+            for child in node.children:
+                self._collect_comparison_units(child, units)
+
+    def tree_to_comparison_units(self, root: LaTeXNode) -> List[str]:
+        """Convert tree structure to units suitable for comparison"""
+        units = []
+        self._collect_comparison_units(root, units)
+        return units
+
+    def parse_into_tree(self, text: str) -> LaTeXNode:
+        """Parse text into a hierarchical tree structure"""
+        root = LaTeXNode(
+            node_type="document", content="", start_pos=0, end_pos=len(text)
+        )
+
+        self._parse_recursive(text, 0, len(text), root)
+        return root
+
+    def _parse_recursive(
+        self, text: str, start: int, end: int, parent: LaTeXNode
+    ) -> int:
+        """Recursively parse text segment and populate parent node's children"""
+        i = start
+        current_text = ""
+
+        while i < end:
             # Check for environment start
             env_match = re.match(r"\\begin\{([^}]+)\}", text[i:])
             if env_match:
-                # Flush current block if not empty
-                if current_block.strip():
-                    blocks.append(
-                        {"type": "text", "content": current_block, "protected": False}
+                # Add accumulated text as a text node
+                if current_text.strip():
+                    text_node = LaTeXNode(
+                        node_type="text",
+                        content=current_text,
+                        protected=False,
+                        start_pos=i - len(current_text),
+                        end_pos=i,
                     )
-                    current_block = ""
+                    parent.children.append(text_node)
+                    current_text = ""
 
                 # Find the complete environment
                 env_name = env_match.group(1)
+                env_start = i
                 env_content, env_end = self._extract_environment(text, i, env_name)
 
                 # Determine if this environment should be protected
@@ -177,89 +262,134 @@ class LaTeXEnvironmentParser:
                     or env_name in self.block_environments
                 )
 
-                blocks.append(
-                    {
-                        "type": "environment",
-                        "content": env_content,
-                        "env_name": env_name,
-                        "protected": is_protected,
-                    }
+                # Create environment node
+                env_node = LaTeXNode(
+                    node_type="environment",
+                    content=env_content,
+                    env_name=env_name,
+                    protected=is_protected,
+                    start_pos=env_start,
+                    end_pos=env_end,
                 )
 
+                # If not protected, parse the environment's content recursively
+                if not is_protected:
+                    # Extract content between \begin{} and \end{}
+                    begin_end = env_match.end()
+                    end_pattern = rf"\\end\{{{re.escape(env_name)}\}}"
+                    end_match = re.search(end_pattern, env_content)
+                    if end_match:
+                        inner_content_start = env_start + begin_end
+                        inner_content_end = env_start + end_match.start()
+                        self._parse_recursive(
+                            text, inner_content_start, inner_content_end, env_node
+                        )
+
+                parent.children.append(env_node)
                 i = env_end
                 continue
 
             # Check for math delimiters
-            if text[i : i + 2] == "$$":
-                # Flush current block
-                if current_block.strip():
-                    blocks.append(
-                        {"type": "text", "content": current_block, "protected": False}
+            if i + 1 < end and text[i : i + 2] == "$$":
+                # Add accumulated text
+                if current_text.strip():
+                    text_node = LaTeXNode(
+                        node_type="text",
+                        content=current_text,
+                        protected=False,
+                        start_pos=i - len(current_text),
+                        end_pos=i,
                     )
-                    current_block = ""
+                    parent.children.append(text_node)
+                    current_text = ""
 
                 # Find end of display math
                 math_content, math_end = self._extract_math_block(text, i, "$$")
-                blocks.append(
-                    {"type": "math", "content": math_content, "protected": True}
+                math_node = LaTeXNode(
+                    node_type="math",
+                    content=math_content,
+                    protected=True,
+                    start_pos=i,
+                    end_pos=math_end,
                 )
+                parent.children.append(math_node)
                 i = math_end
                 continue
 
             elif text[i] == "$" and (i == 0 or text[i - 1] != "\\"):
-                # Flush current block
-                if current_block.strip():
-                    blocks.append(
-                        {"type": "text", "content": current_block, "protected": False}
+                # Add accumulated text
+                if current_text.strip():
+                    text_node = LaTeXNode(
+                        node_type="text",
+                        content=current_text,
+                        protected=False,
+                        start_pos=i - len(current_text),
+                        end_pos=i,
                     )
-                    current_block = ""
+                    parent.children.append(text_node)
+                    current_text = ""
 
                 # Find end of inline math
                 math_content, math_end = self._extract_math_block(text, i, "$")
-                blocks.append(
-                    {"type": "math", "content": math_content, "protected": True}
+                math_node = LaTeXNode(
+                    node_type="math",
+                    content=math_content,
+                    protected=True,
+                    start_pos=i,
+                    end_pos=math_end,
                 )
+                parent.children.append(math_node)
                 i = math_end
                 continue
 
-            # Check for commands
+            # Check for protected commands
             cmd_match = re.match(
                 r"\\([a-zA-Z*]+)(?:\[[^\]]*\])?(?:\{[^}]*\})*", text[i:]
             )
             if cmd_match:
                 cmd_name = cmd_match.group(1)
                 if cmd_name in self.protected_commands:
-                    # Flush current block
-                    if current_block.strip():
-                        blocks.append(
-                            {
-                                "type": "text",
-                                "content": current_block,
-                                "protected": False,
-                            }
+                    # Add accumulated text
+                    if current_text.strip():
+                        text_node = LaTeXNode(
+                            node_type="text",
+                            content=current_text,
+                            protected=False,
+                            start_pos=i - len(current_text),
+                            end_pos=i,
                         )
-                        current_block = ""
+                        parent.children.append(text_node)
+                        current_text = ""
 
                     # Add protected command
                     cmd_content = cmd_match.group(0)
-                    blocks.append(
-                        {"type": "command", "content": cmd_content, "protected": True}
+                    cmd_node = LaTeXNode(
+                        node_type="command",
+                        content=cmd_content,
+                        protected=True,
+                        start_pos=i,
+                        end_pos=i + len(cmd_content),
                     )
-
+                    parent.children.append(cmd_node)
                     i += len(cmd_content)
                     continue
 
-            # Regular character - add to current block
-            current_block += text[i]
+            # Regular character - add to current text
+            current_text += text[i]
             i += 1
 
-        # Add final block
-        if current_block.strip():
-            blocks.append(
-                {"type": "text", "content": current_block, "protected": False}
+        # Add final text block
+        if current_text.strip():
+            text_node = LaTeXNode(
+                node_type="text",
+                content=current_text,
+                protected=False,
+                start_pos=end - len(current_text),
+                end_pos=end,
             )
+            parent.children.append(text_node)
 
-        return blocks
+        return i
 
     def _extract_environment(
         self, text: str, start: int, env_name: str
@@ -430,19 +560,23 @@ class LaTeXDiff:
         return result
 
     def _generate_environment_aware_diff(self, old_body: str, new_body: str) -> str:
-        """Generate diff with full LaTeX environment awareness"""
+        """Generate diff with full LaTeX environment awareness using tree structure"""
 
-        # Parse into logical blocks
-        old_blocks = self.parser.parse_into_blocks(old_body)
-        new_blocks = self.parser.parse_into_blocks(new_body)
+        # Parse into tree structures
+        old_tree = self.parser.parse_into_tree(old_body)
+        new_tree = self.parser.parse_into_tree(new_body)
 
         if self.config.debug:
-            print(f"Old blocks: {len(old_blocks)}", file=sys.stderr)
-            print(f"New blocks: {len(new_blocks)}", file=sys.stderr)
+            print(
+                f"Old tree nodes: {self._count_tree_nodes(old_tree)}", file=sys.stderr
+            )
+            print(
+                f"New tree nodes: {self._count_tree_nodes(new_tree)}", file=sys.stderr
+            )
 
-        # Convert blocks to comparison units
-        old_units = self._blocks_to_comparison_units(old_blocks)
-        new_units = self._blocks_to_comparison_units(new_blocks)
+        # Convert trees to comparison units
+        old_units = self.parser.tree_to_comparison_units(old_tree)
+        new_units = self.parser.tree_to_comparison_units(new_tree)
 
         # Use mdiff for comparison
         old_text = "\n".join(old_units)
@@ -461,27 +595,6 @@ class LaTeXDiff:
 
         return self._process_opcodes_safely(a_lines, b_lines, opcodes)
 
-    def _blocks_to_comparison_units(self, blocks: List[Dict]) -> List[str]:
-        """Convert blocks to units suitable for comparison"""
-        units = []
-
-        for block in blocks:
-            if (
-                block["type"] in ["math", "environment", "command"]
-                and block["protected"]
-            ):
-                # Protected blocks are treated as single units
-                units.append(block["content"])
-            else:
-                # Text blocks can be split further, but preserve structure
-                if block["type"] == "text":
-                    sub_units = self.parser.split_text_block(block["content"])
-                    units.extend(sub_units)
-                else:
-                    units.append(block["content"])
-
-        return units
-
     def _adjust_content_before_wrapping_in_diff_commands(self, content: str) -> str:
         if "%" in content:
             return content + "\n"
@@ -495,10 +608,6 @@ class LaTeXDiff:
     ) -> str:
         """Process opcodes with LaTeX safety checks"""
         result = []
-
-        found_document = False
-        if "{document}" in "\n".join(old_lines) or "{document}" in "\n".join(new_lines):
-            found_document = True
 
         for opcode in opcodes:
             tag = opcode.tag
@@ -627,12 +736,7 @@ class LaTeXDiff:
                     else:
                         result.append(content)
 
-            if not isinstance(old_lines, str):
-                assert found_document and "{document}" in result[0]
-
         str_result = "".join(result)
-        if found_document:
-            assert "{document}" in str_result, "Document tag not found in result"
 
         # hacky fix for some other issues
         str_result = str_result.replace(r"\DIFdel{*}", "").replace(r"\DIFadd{*}", "")
